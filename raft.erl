@@ -151,7 +151,7 @@ server_loop(State) ->
             end;
             
         {get_state, From} ->
-            From ! {state_info, {State#state.role, State#state.current_term, length(State#state.log)}},
+            From ! {state_info, {State#state.role, State#state.current_term, length(State#state.log), State#state.log}},   
             server_loop(State);
             
         {become_leader, From} ->
