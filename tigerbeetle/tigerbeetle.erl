@@ -1,67 +1,56 @@
 -module(tigerbeetle).
 -export([start/0, create_transfer/3, get_balance/1, stop/0]).
 
-% Record definitions
--record(transfer, {id :: integer(), from :: integer(), to :: integer(), amount :: integer(), timestamp :: integer(), checksum :: integer()}).
+-record(state,
+        {db,
+         accounts = #{},
+         pending = queue:new(),
+         replicas = [],
+         view = 1,
+         op_next = 1,
+         prepared = #{},
+         commit_max = 0}).
+-record(transfer,
+        {id :: integer(),
+         from :: integer(),
+         to :: integer(),
+         amount :: integer(),
+         checksum :: integer(),
+         timestamp :: integer()}).
 -record(account, {id :: integer(), balance = 0 :: integer(), checksum :: integer()}).
--record(state, {
-    db :: rocksdb:db_handle(),
-    accounts :: map(),
-    pending :: queue:queue(),
-    commit_max = 0 :: integer(),
-    replicas = [] :: [pid()],
-    view = 1 :: integer(),
-    op_next = 1 :: integer(),
-    prepared = #{} :: map()
-}).
 
-% Start the server
+%% Client API
+
 start() ->
     Pid = spawn(fun() ->
-        {ok, DB} = rocksdb:open("tigerbeetle_db", [{create_if_missing, true}]),
-        Replicas = spawn_replicas(2, self()),
-        InitialState = #state{
-            db = DB,
-            accounts = #{},
-            pending = queue:new(),
-            replicas = Replicas,
-            view = 1,
-            op_next = 1,
-            prepared = #{}
-        },
-        register(tigerbeetle, self()),
-        loop(recover_state(InitialState))
-    end),
+                   case rocksdb:open("primary_db", [{create_if_missing, true}]) of
+                       {ok, DB} ->
+                           io:format("Primary DB opened~n", []),
+                           Replicas = [spawn(fun() -> replica_start(I, self()) end) || I <- [1, 2, 3, 4, 5, 6]],
+                           [io:format("Replica ~p spawned with PID ~p~n", [I, R]) || {I, R} <- lists:zip([1, 2, 3, 4, 5, 6], Replicas)],
+                           InitialState =
+                               #state{db = DB,
+                                      accounts = #{},
+                                      pending = queue:new(),
+                                      replicas = Replicas,
+                                      view = 1,
+                                      op_next = 1,
+                                      prepared = #{}},
+                           register(tigerbeetle, self()),
+                           io:format("Primary registered as tigerbeetle~n", []),
+                           loop(recover_state(InitialState));
+                       {error, Reason} ->
+                           io:format("Primary DB open failed: ~p~n", [Reason]),
+                           exit({db_open_failed, Reason})
+                   end
+                end),
     {ok, Pid}.
 
-% Main server loop (primary)
-loop(State) ->
-    receive
-        {create_transfer, From, To, Amount, ReplyTo} ->
-            {NewState, OpNumber} = queue_transfer(From, To, Amount, ReplyTo, State),
-            loop(NewState);
-        {prepare_ok, OpNumber, ReplicaPid} ->
-            NewState = handle_prepare_ok(OpNumber, ReplicaPid, State),
-            loop(NewState);
-        {commit, OpNumber} ->
-            NewState = commit_operations(OpNumber, State),
-            loop(NewState);
-        {get_balance, AccountId, ReplyTo} ->
-            Balance = get_account_balance(AccountId, State),
-            ReplyTo ! {ok, Balance},
-            loop(State);
-        {stop, ReplyTo} ->
-            [R ! {stop, self()} || R <- State#state.replicas],
-            rocksdb:close(State#state.db),
-            ReplyTo ! ok,
-            ok
-    end.
-
-% Client API
 create_transfer(From, To, Amount) ->
     tigerbeetle ! {create_transfer, From, To, Amount, self()},
     receive
-        {ok, TransferId} -> {ok, TransferId}
+        {ok, TransferId} ->
+            {ok, TransferId}
     after 5000 ->
         {error, timeout}
     end.
@@ -69,7 +58,8 @@ create_transfer(From, To, Amount) ->
 get_balance(AccountId) ->
     tigerbeetle ! {get_balance, AccountId, self()},
     receive
-        {ok, Balance} -> {ok, Balance}
+        {balance, Balance} ->
+            {ok, Balance}
     after 5000 ->
         {error, timeout}
     end.
@@ -77,129 +67,203 @@ get_balance(AccountId) ->
 stop() ->
     tigerbeetle ! {stop, self()},
     receive
-        ok -> ok
+        stopped ->
+            ok
     after 5000 ->
         {error, timeout}
     end.
 
-% Queue a transfer operation (primary)
-queue_transfer(From, To, Amount, ReplyTo, State = #state{db = DB, pending = Pending, op_next = OpNext, replicas = Replicas, view = View}) ->
-    Transfer = #transfer{id = OpNext, from = From, to = To, amount = Amount, timestamp = erlang:system_time(second), checksum = 0},
-    ok = rocksdb:put(DB, term_to_binary({transfer, OpNext}), term_to_binary(Transfer), [{sync, true}]),
-    NewPending = queue:in({Transfer, ReplyTo}, Pending),
-    [R ! {prepare, View, OpNext, Transfer, self()} || R <- Replicas],
-    {State#state{pending = NewPending, op_next = OpNext + 1}, OpNext}.
+%% Primary Process
 
-% Handle prepare acknowledgment from replicas
-handle_prepare_ok(OpNumber, ReplicaPid, State = #state{replicas = Replicas, prepared = Prepared}) ->
-    UpdatedPrepared = maps:update_with(OpNumber, 
-        fun(Acks) -> Acks#{ReplicaPid => ok} end,
-        #{ReplicaPid => ok},
-        Prepared),
-    case maps:size(maps:get(OpNumber, UpdatedPrepared, #{})) >= 2 of
-        true ->
-            self() ! {commit, OpNumber},
-            State#state{prepared = UpdatedPrepared};
-        false ->
-            State#state{prepared = UpdatedPrepared}
+loop(State =
+         #state{db = DB,
+                accounts = Accounts,
+                pending = Pending,
+                replicas = Replicas,
+                view = View,
+                op_next = OpNext,
+                prepared = Prepared,
+                commit_max = CommitMax}) ->
+    receive
+        {create_transfer, From, To, Amount, ReplyTo} ->
+            io:format("Primary received create_transfer: ~p, ~p, ~p~n", [From, To, Amount]),
+            Transfer0 =
+                #transfer{id = OpNext,
+                          from = From,
+                          to = To,
+                          amount = Amount,
+                          timestamp = erlang:system_time(second),
+                          checksum = 0},
+            Checksum = erlang:crc32(term_to_binary(Transfer0)),
+            Transfer = Transfer0#transfer{checksum = Checksum},
+            case rocksdb:put(DB, term_to_binary({transfer, OpNext}), term_to_binary(Transfer), [{sync, true}]) of
+                ok ->
+                    io:format("Primary stored transfer ~p~n", [OpNext]),
+                    NewPending = queue:in({Transfer, ReplyTo}, Pending),
+                    [R ! {prepare, View, OpNext, Transfer, self()} || R <- Replicas],
+                    io:format("Primary sent prepare for op ~p to ~p replicas~n", [OpNext, length(Replicas)]),
+                    loop(State#state{pending = NewPending, op_next = OpNext + 1});
+                {error, Reason} ->
+                    io:format("Primary RocksDB put failed: ~p~n", [Reason]),
+                    exit({rocksdb_error, Reason})
+            end;
+        {prepare_ok, OpNumber, ReplicaPid} ->
+            io:format("Primary received prepare_ok for op ~p from ~p~n", [OpNumber, ReplicaPid]),
+            NewState = handle_prepare_ok(OpNumber, ReplicaPid, State),
+            loop(NewState);
+        {commit, OpNumber} ->
+            io:format("Primary committing op ~p~n", [OpNumber]),
+            NewState = commit_operations(OpNumber, State),
+            loop(NewState);
+        {get_balance, AccountId, ReplyTo} ->
+            Balance =
+                case maps:get(AccountId, Accounts, undefined) of
+                    undefined ->
+                        0;
+                    #account{balance = B} ->
+                        B
+                end,
+            ReplyTo ! {balance, Balance},
+            loop(State);
+        {stop, ReplyTo} ->
+            [R ! {stop, self()} || R <- Replicas],
+            lists:foreach(fun(_) -> receive {replica_stopped, _} -> ok end end, Replicas),
+            rocksdb:close(DB),
+            ReplyTo ! stopped,
+            ok
     end.
 
-% Commit operations up to OpNumber
-commit_operations(OpNumber, State = #state{db = DB, pending = Pending, replicas = Replicas, view = View}) ->
+%% Helper Functions
+
+handle_prepare_ok(OpNumber,
+                  ReplicaPid,
+                  State =
+                      #state{prepared = Prepared,
+                             commit_max = CommitMax,
+                             replicas = Replicas}) ->
+    UpdatedPrepared =
+        maps:update_with(OpNumber,
+                         fun(Acks) -> Acks#{ReplicaPid => ok} end,
+                         #{ReplicaPid => ok},
+                         Prepared),
+    NewState = State#state{prepared = UpdatedPrepared},
+    check_commit(NewState).
+
+check_commit(State =
+                 #state{prepared = Prepared,
+                        commit_max = CommitMax,
+                        replicas = Replicas}) ->
+    Majority = length(Replicas) div 2 + 1,
+    NextOp = CommitMax + 1,
+    case maps:get(NextOp, Prepared, #{}) of
+        Acks when map_size(Acks) >= Majority ->
+            self() ! {commit, NextOp},
+            check_commit(State#state{commit_max = NextOp});
+        _ ->
+            State
+    end.
+
+commit_operations(OpNumber,
+                  State =
+                      #state{pending = Pending,
+                             accounts = Accounts,
+                             replicas = Replicas,
+                             commit_max = CommitMax}) ->
     case queue:peek(Pending) of
         empty ->
             State;
         {value, {Transfer, ReplyTo}} ->
-            if
-                Transfer#transfer.id =< OpNumber ->
-                    NewPending = queue:drop(Pending),
-                    NewState = apply_transfer(Transfer, State),
-                    ReplyTo ! {ok, Transfer#transfer.id},
-                    [R ! {commit, View, OpNumber, Transfer} || R <- Replicas],
-                    commit_operations(OpNumber, NewState#state{
-                        pending = NewPending,
-                        commit_max = max(State#state.commit_max, Transfer#transfer.id)
-                    });
-                true ->
-                    State
+            if Transfer#transfer.id =< OpNumber ->
+                   NewPending = queue:drop(Pending),
+                   NewAccounts = apply_transfer(Transfer, Accounts),
+                   ReplyTo ! {ok, Transfer#transfer.id},
+                   [R ! {commit, State#state.view, Transfer#transfer.id, Transfer}
+                    || R <- Replicas],
+                   commit_operations(OpNumber,
+                                     State#state{pending = NewPending,
+                                                 accounts = NewAccounts,
+                                                 commit_max =
+                                                     max(CommitMax, Transfer#transfer.id)});
+               true ->
+                   State
             end
     end.
 
-% Apply transfer to state and persist to RocksDB
-apply_transfer(Transfer, State = #state{db = DB, accounts = Accounts}) ->
-    FromAccount = maps:get(Transfer#transfer.from, Accounts, #account{id = Transfer#transfer.from}),
+apply_transfer(Transfer, Accounts) ->
+    FromAccount =
+        maps:get(Transfer#transfer.from, Accounts, #account{id = Transfer#transfer.from}),
     ToAccount = maps:get(Transfer#transfer.to, Accounts, #account{id = Transfer#transfer.to}),
-    NewFrom = FromAccount#account{
-        balance = FromAccount#account.balance - Transfer#transfer.amount,
-        checksum = calculate_checksum(FromAccount)
-    },
-    NewTo = ToAccount#account{
-        balance = ToAccount#account.balance + Transfer#transfer.amount,
-        checksum = calculate_checksum(ToAccount)
-    },
-    NewAccounts = Accounts#{Transfer#transfer.from => NewFrom, Transfer#transfer.to => NewTo},
-    ok = rocksdb:put(DB, <<"accounts">>, term_to_binary(NewAccounts), [{sync, true}]),
-    State#state{accounts = NewAccounts}.
+    NewFrom0 =
+        FromAccount#account{balance = FromAccount#account.balance - Transfer#transfer.amount},
+    NewFrom = NewFrom0#account{checksum = erlang:crc32(term_to_binary(NewFrom0))},
+    NewTo0 =
+        ToAccount#account{balance = ToAccount#account.balance + Transfer#transfer.amount},
+    NewTo = NewTo0#account{checksum = erlang:crc32(term_to_binary(NewTo0))},
+    Accounts#{Transfer#transfer.from => NewFrom, Transfer#transfer.to => NewTo}.
 
-% Get account balance
-get_account_balance(AccountId, #state{accounts = Accounts}) ->
-    case maps:get(AccountId, Accounts, undefined) of
-        undefined -> 0;
-        Account -> Account#account.balance
-    end.
+recover_state(State = #state{db = DB, accounts = Accounts}) ->
+    HighestOp = find_highest_op(DB),
+    NewAccounts =
+        lists:foldl(fun(OpNum, Acc) ->
+                       {ok, Bin} = rocksdb:get(DB, term_to_binary({transfer, OpNum}), []),
+                       Transfer = binary_to_term(Bin),
+                       apply_transfer(Transfer, Acc)
+                    end,
+                    Accounts,
+                    lists:seq(1, HighestOp)),
+    State#state{accounts = NewAccounts, op_next = HighestOp + 1}.
 
-% Recover state from RocksDB
-recover_state(State = #state{db = DB}) ->
-    % Load accounts
-    Accounts = case rocksdb:get(DB, <<"accounts">>, []) of
-        {ok, Binary} -> binary_to_term(Binary);
-        not_found -> #{};
-        {error, Reason} -> error({rocksdb_recovery_failed, Reason})
-    end,
-    % Find highest committed operation number
-    CommitMax = case find_highest_op(DB) of
-        {ok, Max} -> Max;
-        not_found -> 0
-    end,
-    State#state{accounts = Accounts, commit_max = CommitMax, op_next = CommitMax + 1}.
-
-% Find highest committed operation number in RocksDB
 find_highest_op(DB) ->
-    {ok, Iterator} = rocksdb:iterator(DB, []),
-    Highest = find_highest_op_loop(rocksdb:iterator_move(Iterator, first), Iterator, 0),
-    rocksdb:iterator_close(Iterator),
-    case Highest of
-        0 -> not_found;
-        N -> {ok, N}
+    {ok, Iter} = rocksdb:iterator(DB, []),
+    Highest = find_highest_op_loop(Iter, rocksdb:iterator_move(Iter, first), 0),
+    rocksdb:iterator_close(Iter),
+    Highest.
+
+find_highest_op_loop(_Iter, {error, invalid_iterator}, Highest) ->
+    Highest;
+find_highest_op_loop(Iter, {ok, KeyBin, _}, Highest) ->
+    Key = catch binary_to_term(KeyBin),
+    NewHighest =
+        case Key of
+            {transfer, OpNum} when is_integer(OpNum) ->
+                max(Highest, OpNum);
+            _ ->
+                Highest
+        end,
+    find_highest_op_loop(Iter, rocksdb:iterator_move(Iter, next), NewHighest).
+
+%% Replica Process
+
+replica_start(Id, Primary) ->
+    DBPath = "replica_" ++ integer_to_list(Id) ++ "_db",
+    case rocksdb:open(DBPath, [{create_if_missing, true}]) of
+        {ok, DB} ->
+            io:format("Replica ~p started~n", [Id]),
+            replica_loop(Primary, DB, #{});
+        {error, Reason} ->
+            io:format("Replica ~p failed to open DB: ~p~n", [Id, Reason]),
+            exit({db_open_failed, Reason})
     end.
 
-find_highest_op_loop({ok, Key, _Value}, Iterator, Max) ->
-    % Safely handle keys that are not valid terms or do not match {transfer, Op}
-    case is_binary(Key) andalso (catch binary_to_term(Key)) of
-        {transfer, Op} when is_integer(Op) andalso Op > Max ->
-            find_highest_op_loop(rocksdb:iterator_move(Iterator, next), Iterator, Op);
-        _ ->
-            find_highest_op_loop(rocksdb:iterator_move(Iterator, next), Iterator, Max)
-    end;
-find_highest_op_loop({error, invalid_iterator}, _Iterator, Max) ->
-    Max.
-
-% Replication (replica process)
-spawn_replicas(Count, Primary) ->
-    [spawn(fun() -> replica_loop(Primary) end) || _ <- lists:seq(1, Count)].
-
-replica_loop(Primary) ->
+replica_loop(Primary, DB, State) ->
     receive
         {prepare, View, OpNumber, Transfer, From} ->
-            From ! {prepare_ok, OpNumber, self()},
-            replica_loop(Primary);
-        {commit, _View, OpNumber, Transfer} ->
-            replica_loop(Primary);
+            io:format("Replica ~p received prepare for op ~p~n", [self(), OpNumber]),
+            case rocksdb:put(DB, term_to_binary({log, OpNumber}), term_to_binary(Transfer), [{sync, true}]) of
+                ok ->
+                    io:format("Replica ~p stored op ~p~n", [self(), OpNumber]),
+                    From ! {prepare_ok, OpNumber, self()},
+                    replica_loop(Primary, DB, State);
+                {error, Reason} ->
+                    io:format("Replica ~p RocksDB put failed: ~p~n", [self(), Reason]),
+                    exit({rocksdb_error, Reason})
+            end;
+        {commit, _View, CommitNumber, Transfer} ->
+            io:format("Replica ~p received commit for op ~p~n", [self(), CommitNumber]),
+            NewState = apply_transfer(Transfer, State),
+            replica_loop(Primary, DB, NewState);
         {stop, ReplyTo} ->
+            rocksdb:close(DB),
             ReplyTo ! {replica_stopped, self()},
             ok
     end.
-
-% Helper
-calculate_checksum(Record) ->
-    erlang:crc32(term_to_binary(Record)).
